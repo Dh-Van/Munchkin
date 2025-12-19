@@ -1,0 +1,38 @@
+{
+    "files.exclude": {
+        "**/.git": true,
+        "**/.svn": true,
+        "**/.hg": true,
+        "**/.DS_Store": true,
+        "**/Thumbs.db": true,
+        ".venv": true,
+        ".vscode": true,
+        ".gitignore": true,
+        ".python-version": true,
+        "pyproject.toml": true,
+        "README.md": true,
+        "uv.lock": true
+    },
+    "hide-files.files": [
+        ".venv",
+        ".vscode",
+        ".gitignore",
+        ".python-version",
+        "pyproject.toml",
+        "README.md",
+        "uv.lock",
+        "sandbox",
+        "tools",
+        "tools/move_limits.py",
+        "tools/set_id.py",
+        "control.py",
+        "main_old.py",
+        "main.py",
+        "mouth_jobs.py",
+        "new.py",
+        "play_angles.py",
+        "record_points.py",
+        "robot.py",
+        "WORKING_POINTS.pkl"
+    ]
+}

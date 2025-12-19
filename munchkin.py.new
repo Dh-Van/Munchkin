@@ -1,0 +1,242 @@
+import time, json, redis, sys, pickle
+import numpy as np
+from robot import Robot
+from control import Controller
+from enum import Enum
+import RPi.GPIO as GPIO
+
+class ARM_STATE(Enum):
+    SCOOP = 0
+    TRACK = 1
+    RECORD = 2
+    HOME = 3
+    RETRACT = 4
+    IDLE = 5
+
+class Munchkin:
+    HZ = 20
+    DT = 1.0 / HZ
+    
+    SHOULDER_ESTOP = 27
+    MAIN_ESTOP = 22
+
+    def __init__(self):
+        NUM_DOF = 4
+        ARM_LENGTHS = [2, 8, 8, 7.35]
+
+        self.robot = Robot(NUM_DOF, ARM_LENGTHS, enable=True)
+        self.controller = Controller(NUM_DOF, ARM_LENGTHS)
+        self.camera_queue = redis.Redis(host='localhost', port=6379, decode_responses=True)
+        
+        # self.state = ARM_STATE.HOME
+        self.state = ARM_STATE.IDLE
+        
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setup(self.SHOULDER_ESTOP, GPIO.IN)
+        GPIO.setup(self.MAIN_ESTOP, GPIO.IN)
+
+        self.theta = self.robot.get_theta_list()
+        
+        self.save_angles = False
+        
+        self.loop_iteration = 0
+        self.timer = 0
+        self.depth_limit = 20
+        self.depth_in_limit = 30
+        self.depth_stay_limit = 20
+        
+        self.retract_limit = 30
+        
+        self.feed = False
+        self.depth_in = False
+        
+        self.recorded_angles = []
+    
+    def start(self):
+        try:
+            self.periodic()
+        except KeyboardInterrupt:
+            self.robot.disable()
+            if(self.save_angles):
+                window_size = 5
+                smoothed_angles = []
+                
+                raw_data = np.array(self.recorded_angles)
+                
+                for i in range(raw_data.shape[1]):
+                    smooth_col = np.convolve(raw_data[:, i], np.ones(window_size)/window_size, mode='valid')
+                    smoothed_angles.append(smooth_col)
+                    
+                final_data = np.array(smoothed_angles).T.tolist()
+    
+                with open('recordings/Scoop.pkl', 'wb') as f:
+                    pickle.dump(final_data, f)
+                
+            sys.exit(0)
+            
+    def periodic(self):
+        while True:
+            
+            if self.check_estop():
+                self.robot.disable()
+                raise KeyboardInterrupt
+            
+            start_time = time.time()
+            match self.state:
+                case ARM_STATE.TRACK:
+                    self.mouth_tracking()
+                case ARM_STATE.SCOOP:
+                    self.scoop()
+                case ARM_STATE.RECORD:
+                    self.record()
+                case ARM_STATE.HOME:
+                    self.home()
+                case ARM_STATE.RETRACT:
+                    self.retract()
+                case ARM_STATE.IDLE:
+                    self.idle()
+                    
+            sleep_time = self.DT - (time.time() - start_time)
+            if(sleep_time < 0):
+                print(f'Loop Overrun: {sleep_time - self.DT}s')
+            time.sleep(max(sleep_time, 0.0))
+            
+    def check_estop(self):
+        if GPIO.input(self.SHOULDER_ESTOP) or not GPIO.input(self.MAIN_ESTOP):
+            return False
+        return True
+            
+    def idle(self):
+        # print("test")
+        if GPIO.input(27):
+            print("pressed")
+        else:
+            print("not pressed")
+            
+    def home(self):
+        HOME_ANGLES = [0.038, 0.8, -2.304, 0.101]
+        self.robot.set_theta_list(HOME_ANGLES)
+        
+        # self.set_state(ARM_STATE.RECORD)
+        self.set_state(ARM_STATE.SCOOP)
+            
+    def record(self):
+        self.save_angles = True
+        self.robot.disable()
+        
+        angles = self.robot.get_theta_list()
+        self.recorded_angles.append(angles)
+        
+        
+    def scoop(self):
+        if(len(self.recorded_angles) < 2):
+            with open('recordings/Scoop.pkl', 'rb') as f:
+                self.recorded_angles = pickle.load(f)
+                
+
+        if(self.loop_iteration >= len(self.recorded_angles)):
+            self.set_state(ARM_STATE.TRACK)
+            self.theta = self.recorded_angles[-1]
+            return
+                
+        self.robot.set_theta_list(self.recorded_angles[self.loop_iteration], time=self.DT * 1000 * 1.5)
+                    
+        self.loop_iteration += 1        
+        
+                            
+    def mouth_tracking(self):
+        data = json.loads(self.camera_queue.get("mouth_position"))
+        cam_depth = data['z']
+
+        if self.depth_in:
+            ee_vel = np.array([0.0, -1.5, 0.0])
+            
+            self.feed_timer += 1
+            
+            if(self.feed_timer > self.depth_in_limit):
+                print("WAITING")
+                ee_vel = np.array([0.0, 0.0, 0.0])
+            
+            if self.feed_timer > self.depth_in_limit + self.depth_stay_limit:
+                print("Retracting")
+                self.set_state(ARM_STATE.RETRACT)
+            
+            theta_next = self.controller.velocity_kinematics(self.theta, ee_vel * self.DT)
+            self.robot.set_theta_list(theta_next, time=self.DT * 1000 * 1.5)
+            self.theta = theta_next
+            return
+
+        ee_vel = np.array([0.0, 0.0, 0.0])
+        data = json.loads(self.camera_queue.get("mouth_position"))
+
+        # if(not data['mouth_open'] and self.timer < 10):
+        #     self.set_state(ARM_STATE.RETRACT)
+
+        
+        if(data['tracking']):
+            cam_x = data['x']
+            cam_y = data['y']
+            
+            
+            if cam_depth <= 50:
+                self.stability_timer += 1
+                print(f"Target in range... {self.stability_timer}/{self.depth_limit}")
+            else:
+                self.stability_timer = 0
+
+            if self.stability_timer > self.depth_limit:
+                print("Switching to FEED mode")
+                self.depth_in = True
+                self.feed_timer = 0
+                return
+
+            if cam_depth > 50:
+                ee_vel[0] = -cam_x * 0.01
+                ee_vel[1] = -1.5
+                ee_vel[2] = -cam_y * 0.01
+        else:
+            self.depth_in = True
+            self.feed_timer = self.depth_in_limit
+
+        # Apply Tracking Velocity
+        theta_next = self.controller.velocity_kinematics(self.theta, ee_vel * self.DT)
+        self.robot.set_theta_list(theta_next, time=self.DT * 1000 * 1.5)
+        self.theta = theta_next
+            
+    def retract(self):
+            if(self.timer > self.retract_limit):
+                print("Retract limit reached")
+                self.set_state(ARM_STATE.HOME)
+            ee_vel = np.array([0.0, 5.0, 0.0])
+            theta_next = self.controller.velocity_kinematics(self.theta, ee_vel * self.DT)
+            self.robot.set_theta_list(theta_next, time=self.DT * 1000)
+            self.theta = theta_next
+            
+            self.timer += 1
+
+
+    def set_state(self, new_state, next_state=None):
+        self.state = new_state
+        
+        time.sleep(0.2)
+        
+        if(new_state == ARM_STATE.RECORD):
+            self.robot.disable()
+            print("RECORDING")
+            
+        if(new_state == ARM_STATE.RETRACT):
+            self.timer = 0
+            
+        if(new_state == ARM_STATE.SCOOP):
+            self.timer = 0
+            self.loop_iteration = 0
+            
+        if(new_state == ARM_STATE.TRACK):
+            self.depth_in = False
+            self.stability_timer = 0
+            self.feed_timer = 0
+    
+    
+munchkin = Munchkin()
+
+munchkin.start()

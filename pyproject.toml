@@ -1,0 +1,21 @@
+[project]
+name = "munchkin-control"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "numpy",
+    "pylx16a",
+    "redis>=7.1.0",
+    "rpi-gpio>=0.7.1",
+]
+
+[tool.uv]
+required-environments = [
+    "sys_platform == 'linux' and platform_machine == 'aarch64'"
+]
+
+# Optional: prevent installing heavy GUI backends like PyQt6
+exclude-dependencies = ["pyqt6", "pyqt6-qt6", "pyqt6-qt6-aux"]
+
